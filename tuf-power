@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+# tuf-power: power-profile helper for ASUS TUF Dash F15 FX517ZR
+# Ubuntu 22.04 / bash 5.x
+set -Eeuo pipefail
+
+VERSION="1.0"
+ASUS_DIR="/sys/devices/platform/asus-nb-wmi"
+PLATFORM_PROFILE="/sys/firmware/acpi/platform_profile"
+CPUFREQ_DIR="/sys/devices/system/cpu/cpufreq"
+INTEL_PSTATE="/sys/devices/system/cpu/intel_pstate"
+STATE_DIR="/var/lib/tuf-power-manager"
+STATE_FILE="$STATE_DIR/original-state"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+has() { command -v "$1" >/dev/null 2>&1; }
+read_file() {
+    local f="$1"
+    if [[ -r "$f" ]]; then cat "$f" 2>/dev/null || true; else printf '%s' "n/a"; fi
+}
+write_file() {
+    local f="$1" value="$2"
+    [[ -e "$f" ]] || die "File not found: $f"
+    printf '%s\n' "$value" > "$f" || die "Could not write '$value' to $f"
+}
+need_root() {
+    [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Run this command with sudo, e.g. sudo tuf-power set ultra-silent"
+}
+
+get_hwmon_value() {
+    # Usage: get_hwmon_value <hwmon-name> <attribute-glob>
+    local wanted="$1" pattern="$2" d f
+    for d in /sys/class/hwmon/hwmon*; do
+        [[ -r "$d/name" ]] || continue
+        [[ "$(cat "$d/name" 2>/dev/null)" == "$wanted" ]] || continue
+        for f in "$d"/$pattern; do
+            [[ -r "$f" ]] || continue
+            printf '%s=%s ' "$(basename "$f")" "$(cat "$f" 2>/dev/null || echo n/a)"
+        done
+    done
+}
+
+print_status() {
+    local product board f d name class vendor
+    product="$(read_file /sys/class/dmi/id/product_name)"
+    board="$(read_file /sys/class/dmi/id/board_name)"
+
+    echo "============================================================"
+    echo " ASUS TUF power status  (tuf-power $VERSION)"
+    echo "============================================================"
+    printf "Model:              %s (board: %s)\n" "$product" "$board"
+    printf "Kernel:             %s\n" "$(uname -r)"
+    printf "GNOME/PPD profile:  "
+    if has powerprofilesctl; then
+        powerprofilesctl get 2>/dev/null || echo "unavailable"
+    else
+        echo "powerprofilesctl not installed"
+    fi
+    printf "Platform profile:   %s\n" "$(read_file "$PLATFORM_PROFILE")"
+    printf "Available profiles: %s\n" "$(read_file /sys/firmware/acpi/platform_profile_choices)"
+    printf "ASUS thermal policy: %s (0=default, 1=overboost, 2=silent; read-only here)\n" \
+        "$(read_file "$ASUS_DIR/throttle_thermal_policy")"
+
+    echo
+    echo "-- CPU --"
+    printf "Driver:             %s\n" "$(read_file "$CPUFREQ_DIR/policy0/scaling_driver")"
+    printf "Governor:           %s\n" "$(read_file "$CPUFREQ_DIR/policy0/scaling_governor")"
+    printf "Turbo no_turbo:     %s (0=enabled, 1=disabled)\n" \
+        "$(read_file "$INTEL_PSTATE/no_turbo")"
+    printf "Intel P-State:      %s\n" "$(read_file "$INTEL_PSTATE/status")"
+    printf "EPP options:        %s\n" "$(read_file "$CPUFREQ_DIR/policy0/energy_performance_available_preferences")"
+    printf "CPU policies (current/min/max MHz; EPP):\n"
+    local found=0 p base cur min max epp
+    for p in "$CPUFREQ_DIR"/policy*; do
+        [[ -d "$p" ]] || continue
+        base="$(basename "$p")"
+        cur="$(read_file "$p/scaling_cur_freq")"
+        min="$(read_file "$p/scaling_min_freq")"
+        max="$(read_file "$p/scaling_max_freq")"
+        epp="$(read_file "$p/energy_performance_preference")"
+        if [[ "$cur" =~ ^[0-9]+$ && "$min" =~ ^[0-9]+$ && "$max" =~ ^[0-9]+$ ]]; then
+            printf "  %-8s %7.0f / %7.0f / %7.0f MHz  EPP=%s\n" "$base" \
+                "$(awk "BEGIN {print $cur/1000}")" "$(awk "BEGIN {print $min/1000}")" \
+                "$(awk "BEGIN {print $max/1000}")" "$epp"
+        else
+            printf "  %-8s current=%s min=%s max=%s EPP=%s\n" "$base" "$cur" "$min" "$max" "$epp"
+        fi
+        found=1
+    done
+    [[ $found -eq 1 ]] || echo "  (CPUFreq policy interface not found)"
+
+    echo
+    echo "-- Temperatures and fans --"
+    local temp_found=0
+    for d in /sys/class/hwmon/hwmon*; do
+        [[ -r "$d/name" ]] || continue
+        name="$(cat "$d/name" 2>/dev/null || true)"
+        if [[ "$name" == "coretemp" ]]; then
+            for f in "$d"/temp*_label; do
+                [[ -r "$f" ]] || continue
+                if [[ "$(cat "$f" 2>/dev/null)" == "Package id 0" ]]; then
+                    local input="${f%_label}_input"
+                    if [[ -r "$input" ]]; then
+                        printf "CPU package:        %.1f °C\n" "$(awk "BEGIN {print $(cat "$input")/1000}")"
+                        temp_found=1
+                    fi
+                fi
+            done
+        elif [[ "$name" == "acpitz" && $temp_found -eq 0 ]]; then
+            [[ -r "$d/temp1_input" ]] && printf "ACPI zone:          %.1f °C\n" \
+                "$(awk "BEGIN {print $(cat "$d/temp1_input")/1000}")"
+        elif [[ "$name" == "asus" ]]; then
+            for f in "$d"/fan*_input; do
+                [[ -r "$f" ]] || continue
+                printf "%-20s %s RPM\n" "$(basename "$f")" "$(cat "$f" 2>/dev/null || echo n/a)"
+            done
+        fi
+    done
+    [[ $temp_found -eq 1 ]] || echo "CPU package sensor: not found"
+
+    echo
+    echo "-- ASUS tunables (reported only; script does not change these) --"
+    for name in charge_mode ppt_pl1_spl ppt_pl2_sppt nv_dynamic_boost nv_temp_target dgpu_disable gpu_mux_mode; do
+        [[ -e "$ASUS_DIR/$name" ]] && printf "%-20s %s\n" "$name:" "$(read_file "$ASUS_DIR/$name")"
+    done
+    echo "Note: PPT/NVIDIA power-limit attributes may be blank on this kernel."
+    if has upower; then
+        local bat
+        bat="$(upower -e 2>/dev/null | grep -m1 'BAT' || true)"
+        if [[ -n "$bat" ]]; then
+            echo "-- Battery --"
+            upower -i "$bat" 2>/dev/null | grep -E 'state:|percentage:|energy-rate:' || true
+        fi
+    fi
+    for d in /sys/class/hwmon/hwmon*; do
+        [[ -r "$d/name" ]] || continue
+        if [[ "$(cat "$d/name" 2>/dev/null)" == "asus_custom_fan_curve" ]]; then
+            echo "Fan curve interface: present (not modified by this script)"
+        fi
+    done
+
+    echo
+    echo "-- NVIDIA / PRIME --"
+    if has prime-select; then
+        printf "PRIME mode:         %s\n" "$(prime-select query 2>/dev/null || echo unknown)"
+    else
+        echo "PRIME mode:         prime-select not installed"
+    fi
+    local nvidia_found=0
+    for d in /sys/bus/pci/devices/*; do
+        [[ -r "$d/vendor" && -r "$d/class" ]] || continue
+        vendor="$(cat "$d/vendor" 2>/dev/null || true)"
+        class="$(cat "$d/class" 2>/dev/null || true)"
+        [[ "$vendor" == "0x10de" && "$class" == 0x03* ]] || continue
+        nvidia_found=1
+        printf "PCI device:         %s\n" "$(basename "$d")"
+        printf "  power/control:    %s\n" "$(read_file "$d/power/control")"
+        printf "  runtime_status:   %s\n" "$(read_file "$d/power/runtime_status")"
+    done
+    [[ $nvidia_found -eq 1 ]] || echo "NVIDIA display PCI device not found"
+    if has nvidia-smi; then
+        echo "nvidia-smi:"
+        nvidia-smi --query-gpu=name,pstate,temperature.gpu,power.draw,utilization.gpu --format=csv,noheader 2>&1 || \
+            echo "  NVIDIA driver is not active (normal when PRIME Intel mode is selected)."
+    fi
+    echo
+    echo "-- Saved original settings --"
+    if [[ -f "$STATE_FILE" ]]; then
+        echo "A restore snapshot exists: $STATE_FILE"
+        echo "Use: sudo tuf-power restore"
+    else
+        echo "No snapshot saved."
+    fi
+    echo "============================================================"
+}
+
+save_original_state() {
+    [[ -f "$STATE_FILE" ]] && return 0
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    {
+        if has powerprofilesctl; then
+            printf 'PPD|%s\n' "$(powerprofilesctl get 2>/dev/null || echo unknown)"
+        else
+            printf 'PPD|unknown\n'
+        fi
+        printf 'PLATFORM|%s\n' "$(read_file "$PLATFORM_PROFILE")"
+        printf 'NO_TURBO|%s\n' "$(read_file "$INTEL_PSTATE/no_turbo")"
+        local f
+        for f in "$CPUFREQ_DIR"/policy*/energy_performance_preference; do
+            [[ -r "$f" ]] || continue
+            printf 'EPP|%s|%s\n' "$f" "$(cat "$f" 2>/dev/null || echo unknown)"
+        done
+    } > "$STATE_FILE"
+    chmod 600 "$STATE_FILE"
+    echo "Saved the current settings for 'restore' at $STATE_FILE"
+}
+
+set_gnome_profile() {
+    local profile="$1"
+    if has powerprofilesctl; then
+        powerprofilesctl set "$profile" || die "powerprofilesctl could not set '$profile'"
+    else
+        local platform="$2"
+        [[ -w "$PLATFORM_PROFILE" ]] || die "powerprofilesctl is missing and platform_profile is not writable"
+        write_file "$PLATFORM_PROFILE" "$platform"
+    fi
+}
+
+set_all_epp() {
+    local value="$1" f count=0
+    for f in "$CPUFREQ_DIR"/policy*/energy_performance_preference; do
+        [[ -e "$f" ]] || continue
+        write_file "$f" "$value"
+        ((count+=1))
+    done
+    [[ $count -gt 0 ]] || die "No Intel EPP interfaces found."
+}
+
+apply_profile() {
+    local profile="$1" ppd epp turbo platform
+    case "$profile" in
+        ultra-silent)
+            ppd="power-saver"; platform="quiet"; epp="power"; turbo="1"
+            ;;
+        quiet)
+            ppd="power-saver"; platform="quiet"; epp="balance_performance"; turbo="1"
+            ;;
+        balanced)
+            ppd="balanced"; platform="balanced"; epp="balance_performance"; turbo="0"
+            ;;
+        performance)
+            ppd="performance"; platform="performance"; epp="performance"; turbo="0"
+            ;;
+        *)
+            die "Unknown profile '$profile'. Run: tuf-power profiles"
+            ;;
+    esac
+
+    need_root
+    [[ -d "$ASUS_DIR" ]] || die "ASUS WMI interface not found: $ASUS_DIR"
+    [[ -w "$INTEL_PSTATE/no_turbo" ]] || die "Intel no_turbo interface not available."
+    if ! has powerprofilesctl && [[ ! -w "$PLATFORM_PROFILE" ]]; then
+        die "No supported platform-profile control found."
+    fi
+    save_original_state
+
+    echo "Applying profile: $profile"
+    set_gnome_profile "$ppd" "$platform"
+    # Set EPP after powerprofilesctl/platform-profile to avoid a profile change
+    # overriding the chosen EPP during the same transition.
+    set_all_epp "$epp"
+    write_file "$INTEL_PSTATE/no_turbo" "$turbo"
+
+    # Runtime PM is reported, not forcibly changed. PRIME switching can require
+    # a reboot and may affect external display ports.
+    echo "Applied: GNOME=$ppd, ASUS=$platform, EPP=$epp, Turbo=$([[ $turbo == 1 ]] && echo off || echo on)"
+    echo "NVIDIA/PRIME mode was not changed. Check: tuf-power status"
+}
+
+restore_state() {
+    need_root
+    [[ -f "$STATE_FILE" ]] || die "No saved snapshot. Nothing to restore."
+    local ppd="unknown" platform="unknown" no_turbo="unknown"
+    local type a b
+    while IFS='|' read -r type a b; do
+        case "$type" in
+            PPD) ppd="$a" ;;
+            PLATFORM) platform="$a" ;;
+            NO_TURBO) no_turbo="$a" ;;
+        esac
+    done < "$STATE_FILE"
+
+    if has powerprofilesctl && [[ "$ppd" == "performance" || "$ppd" == "balanced" || "$ppd" == "power-saver" ]]; then
+        powerprofilesctl set "$ppd" || echo "Warning: could not restore GNOME profile '$ppd'." >&2
+    elif [[ "$platform" != "n/a" && "$platform" != "unknown" && -w "$PLATFORM_PROFILE" ]]; then
+        write_file "$PLATFORM_PROFILE" "$platform"
+    fi
+
+    while IFS='|' read -r type a b; do
+        case "$type" in
+            EPP)
+                [[ -e "$a" && "$b" != "unknown" ]] && write_file "$a" "$b"
+                ;;
+        esac
+    done < "$STATE_FILE"
+
+    if [[ "$no_turbo" == "0" || "$no_turbo" == "1" ]]; then
+        write_file "$INTEL_PSTATE/no_turbo" "$no_turbo"
+    fi
+    rm -f "$STATE_FILE"
+    echo "Original settings restored. (NVIDIA PRIME mode was never changed.)"
+}
+
+set_gpu_mode() {
+    local mode="$1"
+    need_root
+    has prime-select || die "prime-select is not installed."
+    case "$mode" in
+        intel|on-demand)
+            prime-select "$mode" || die "prime-select failed."
+            echo "PRIME mode set to '$mode'. A reboot is required for the change to take effect."
+            echo "External display outputs wired to NVIDIA may be unavailable in Intel mode."
+            ;;
+        *)
+            die "GPU mode must be 'intel' or 'on-demand'."
+            ;;
+    esac
+}
+
+print_profiles() {
+    cat <<'EOF'
+Available profiles:
+  ultra-silent  GNOME power-saver; ASUS Quiet; EPP=power; Turbo OFF
+  quiet         GNOME power-saver; ASUS Quiet; EPP=balance_performance; Turbo OFF
+  balanced      GNOME Balanced;    ASUS Balanced; EPP=balance_performance; Turbo ON
+  performance   GNOME Performance; ASUS Performance; EPP=performance; Turbo ON
+
+Separate GPU mode commands (require reboot):
+  sudo tuf-power gpu intel
+  sudo tuf-power gpu on-demand
+EOF
+}
+
+usage() {
+    cat <<'EOF'
+Usage:
+  tuf-power status
+  tuf-power profiles
+  sudo tuf-power set <ultra-silent|quiet|balanced|performance>
+  sudo tuf-power restore
+  sudo tuf-power gpu <intel|on-demand>
+
+Notes:
+  - 'set' saves the original CPU/platform settings on first use.
+  - 'restore' returns those saved settings.
+  - NVIDIA PRIME mode is not changed by CPU/thermal profiles.
+  - PRIME GPU-mode changes require a reboot.
+  - Fan curves and manual fan speeds are never modified.
+EOF
+}
+
+case "${1:-status}" in
+    status) print_status ;;
+    profiles) print_profiles ;;
+    set)
+        [[ $# -eq 2 ]] || { usage; exit 2; }
+        apply_profile "$2"
+        ;;
+    restore) restore_state ;;
+    gpu)
+        [[ $# -eq 2 ]] || { usage; exit 2; }
+        set_gpu_mode "$2"
+        ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 2 ;;
+esac
